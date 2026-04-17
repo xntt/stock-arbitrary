@@ -7,7 +7,7 @@ from datetime import datetime
 
 st.set_page_config(page_title="中美股市连涨监控 - 龙头共振", layout="wide")
 st.title("🇺🇸 美股 & 🇨🇳 A股 3日/5日持续增长监控系统（龙头版）")
-st.markdown("**自动同时监控3日和5日连涨** | 只关注龙头板块与个股 | 数据来源：雅虎财经 + 新浪财经")
+st.markdown("**自动同时显示3日和5日连涨情况** | 只关注龙头板块与个股 | 已修复数据不足导致的崩溃")
 
 # ====================== 配置 ======================
 US_SECTORS = {
@@ -28,14 +28,23 @@ A_LEADERS = {
 }
 
 # ====================== 数据获取 ======================
-@st.cache_data(ttl=1800)  # 30分钟缓存
+@st.cache_data(ttl=1800)
 def fetch_us_data(ticker: str):
     try:
         df = yf.download(ticker, period="60d", interval="1d", progress=False, auto_adjust=True)
-        if df.empty or len(df) < 6:
+        if df is None or df.empty:
             return None
-        return df[['Close']].rename(columns={"Close": "close"})
-    except:
+        # 处理可能的 MultiIndex 列（新版 yfinance）
+        if isinstance(df.columns, pd.MultiIndex):
+            df = df.xs(ticker, axis=1, level=1) if len(df.columns.levels) > 1 else df
+        if 'Close' in df.columns:
+            df = df[['Close']].rename(columns={"Close": "close"})
+        elif 'close' not in df.columns:
+            return None
+        if len(df) < 6:
+            return None
+        return df
+    except Exception:
         return None
 
 @st.cache_data(ttl=1800)
@@ -47,7 +56,9 @@ def fetch_a_data(symbol: str):
         if resp.status_code != 200:
             return None
         text = resp.text.strip()
-        data = json.loads(text) if text.startswith("[") else []
+        if not text.startswith("["):
+            return None
+        data = json.loads(text)
         if not data or len(data) < 6:
             return None
         df = pd.DataFrame(data)
@@ -57,40 +68,43 @@ def fetch_a_data(symbol: str):
             if col in df.columns:
                 df[col] = pd.to_numeric(df[col], errors="coerce")
         return df[["day", "close"]]
-    except:
+    except Exception:
         return None
 
 def calculate_streaks(df):
-    """同时计算3日和5日涨幅 + 连涨天数"""
+    """安全计算3日和5日涨幅 + 连涨天数"""
     if df is None or len(df) < 6:
-        return None, None, 0, 0, 0   # ret3, ret5, streak3, streak5, current_streak
+        return None, None, 0, 0, 0
+
     closes = df["close"].values
+    if len(closes) < 6:
+        return None, None, 0, 0, 0
+
     latest = closes[-1]
 
-    # 3日和5日涨幅
+    # 只有数据足够时才计算，避免索引错误
     ret3 = round((latest / closes[-4] - 1) * 100, 2) if len(closes) >= 4 else None
     ret5 = round((latest / closes[-6] - 1) * 100, 2) if len(closes) >= 6 else None
 
-    # 当前连涨天数（连续上涨天数）
+    # 当前连涨天数
     current_streak = 0
-    for i in range(len(closes)-1, 0, -1):
-        if closes[i] > closes[i-1]:
+    for i in range(len(closes) - 1, 0, -1):
+        if closes[i] > closes[i - 1] + 1e-6:   # 避免浮点误差
             current_streak += 1
         else:
             break
 
-    # 过去3天内连涨天数（简化：只要最近3天都是上涨就视为3日连涨）
-    streak3 = sum(1 for i in range(-3, 0) if closes[i] > closes[i-1]) if len(closes) >= 3 else 0
-    streak5 = sum(1 for i in range(-5, 0) if closes[i] > closes[i-1]) if len(closes) >= 5 else 0
+    # 最近N天连涨天数
+    streak3 = sum(1 for i in range(-3, 0) if closes[i] > closes[i - 1] + 1e-6) if len(closes) >= 3 else 0
+    streak5 = sum(1 for i in range(-5, 0) if closes[i] > closes[i - 1] + 1e-6) if len(closes) >= 5 else 0
 
     return ret3, ret5, streak3, streak5, current_streak
 
 # ====================== 主界面 ======================
 tabs = st.tabs(["🇺🇸 美股板块", "🇺🇸 美股龙头个股", "🇨🇳 A股龙头个股", "🔄 中美共振对比"])
 
-# 美股板块
 with tabs[0]:
-    st.subheader("美股板块（Sector ETFs） - 3日/5日连涨")
+    st.subheader("美股板块（Sector ETFs）")
     data_list = []
     for name, ticker in US_SECTORS.items():
         df = fetch_us_data(ticker)
@@ -101,21 +115,17 @@ with tabs[0]:
                 "板块": name, "代码": ticker, "最新价": latest_price,
                 "3日涨幅%": ret3, "5日涨幅%": ret5,
                 "3日连涨天数": s3, "5日连涨天数": s5,
-                "当前连涨": curr
+                "当前连涨天数": curr
             })
     if data_list:
-        df_us_sector = pd.DataFrame(data_list)
-        # 高亮显示符合条件的
-        st.dataframe(
-            df_us_sector.style.apply(lambda x: ['background-color: #d4edda' if (x['3日连涨天数'] >= 3 or x['5日连涨天数'] >= 5) else '' for x in df_us_sector.itertuples()], axis=1),
-            use_container_width=True, hide_index=True
-        )
+        df_sector = pd.DataFrame(data_list)
+        st.dataframe(df_sector, use_container_width=True, hide_index=True)
+        st.success(f"共显示 {len(data_list)} 个板块数据")
     else:
-        st.info("暂无美股板块数据")
+        st.warning("暂无美股板块数据（可能网络或 yfinance 临时问题）")
 
-# 美股龙头个股
 with tabs[1]:
-    st.subheader("美股龙头个股 - 3日/5日连涨")
+    st.subheader("美股龙头个股")
     data_list = []
     for ticker in US_LEADERS:
         df = fetch_us_data(ticker)
@@ -126,17 +136,15 @@ with tabs[1]:
                 "个股": ticker, "最新价": latest_price,
                 "3日涨幅%": ret3, "5日涨幅%": ret5,
                 "3日连涨天数": s3, "5日连涨天数": s5,
-                "当前连涨": curr
+                "当前连涨天数": curr
             })
     if data_list:
-        df_us_leader = pd.DataFrame(data_list)
-        st.dataframe(df_us_leader, use_container_width=True, hide_index=True)
+        st.dataframe(pd.DataFrame(data_list), use_container_width=True, hide_index=True)
     else:
-        st.info("暂无美股龙头数据")
+        st.warning("暂无美股龙头数据")
 
-# A股龙头
 with tabs[2]:
-    st.subheader("A股龙头个股（按板块） - 3日/5日连涨")
+    st.subheader("A股龙头个股（按板块分组）")
     data_list = []
     name_map = {
         "sh600519": "贵州茅台", "sz300750": "宁德时代", "sz002594": "比亚迪",
@@ -157,29 +165,27 @@ with tabs[2]:
                     "最新价": latest_price,
                     "3日涨幅%": ret3, "5日涨幅%": ret5,
                     "3日连涨天数": s3, "5日连涨天数": s5,
-                    "当前连涨": curr
+                    "当前连涨天数": curr
                 })
     if data_list:
-        df_a = pd.DataFrame(data_list)
-        st.dataframe(df_a, use_container_width=True, hide_index=True)
+        st.dataframe(pd.DataFrame(data_list), use_container_width=True, hide_index=True)
     else:
-        st.info("暂无A股龙头数据或新浪API暂不可用")
+        st.warning("暂无A股数据（新浪API可能临时不可用）")
 
-# 共振对比
 with tabs[3]:
     st.subheader("🔄 中美市场共振对比")
     st.markdown("""
-    **共振信号判断**（手动观察或后续可自动化）：
-    - **科技/半导体**：美股 XLK / NVDA 等 与 A股 中芯国际、卓胜微
-    - **新能源/汽车**：美股 TSLA 与 A股 宁德时代、比亚迪
-    - **消费/白酒/医药**：美股 XLV / LLY 与 A股 贵州茅台、恒瑞医药
-    - **金融**：美股 XLF / JPM 与 A股 工商银行等
+    **共振信号参考**：
+    - 科技/半导体：美股 XLK / NVDA 与 A股 中芯国际等
+    - 新能源/汽车：美股 TSLA 与 A股 宁德时代、比亚迪
+    - 消费/医药：美股 XLV / LLY 与 A股 贵州茅台、恒瑞医药
+    - 金融：美股 XLF / JPM 与 A股 银行股
+    当**同一主题**同时在中美出现较强3日或5日连涨时，即为潜在共振。
     """)
-    st.info("当**同一主题**在中美同时出现 3日或5日连涨（涨幅正值 + 连涨天数达标），即视为**潜在共振**。建议结合成交量和宏观新闻验证。")
+    st.info("建议结合成交量和新闻进一步验证。")
 
-st.caption(f"最后更新：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}（美股实时，A股新浪API） | 非投资建议，仅供监控参考")
+st.caption(f"最后更新：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | 非投资建议")
 
-# 刷新按钮
-if st.button("🔄 刷新全部数据"):
+if st.button("🔄 刷新全部数据（清除缓存）"):
     st.cache_data.clear()
     st.rerun()
